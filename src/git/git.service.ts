@@ -1,69 +1,139 @@
 import {Injectable, Logger, OnApplicationBootstrap} from '@nestjs/common';
-import {EMPTY, from, Subject, switchMap} from 'rxjs';
+import {catchError, EMPTY, filter, from, map, merge, Subject, switchMap, tap,} from 'rxjs';
 import {emptyDirSync} from 'fs-extra';
 import simpleGit, {SimpleGit, SimpleGitProgressEvent} from 'simple-git';
 import * as assert from 'assert';
 import * as fs from 'fs';
 import * as path from 'path';
+import {CronExpression, SchedulerRegistry} from '@nestjs/schedule';
+import {CronJob} from 'cron';
 
 @Injectable()
 export class GitService implements OnApplicationBootstrap {
-  private git: SimpleGit;
-  private gitProgress = new Subject<SimpleGitProgressEvent>();
+    private git: SimpleGit;
+    private gitProgress = new Subject<SimpleGitProgressEvent>();
 
-  private readonly logger = new Logger(GitService.name);
-  private repoBaseDir = path.join('C:\\', 'repositories_new');
-  private masterBaseDir = path.join(this.repoBaseDir, 'masterBranch');
-  private remote;
+    private readonly logger = new Logger(GitService.name);
 
-  constructor() {
-    this.git = simpleGit({
-      progress: (event: SimpleGitProgressEvent) => this.gitProgress.next(event),
-    });
-    this.remote = this.getBasicAuthUrl('github.com/SaschaBS/sandbox.git');
-  }
+    private readonly masterBaseDir: string;
+    private readonly localRepoPath: string;
+    private readonly remote: string;
+
+    constructor(private schedulerRegistry: SchedulerRegistry) {
+        this.git = simpleGit({
+            progress: (event: SimpleGitProgressEvent) => this.gitProgress.next(event),
+        });
+
+        this.localRepoPath = process.env.LOCAL_REPO_PATH;
+
+        const user = process.env.GIT_USER;
+        const pass = process.env.GIT_PASSWORD;
+        const remoteRepoPath = process.env.REMOTE_REPO_PATH;
+
+        assert(user, 'environment variable GIT_USER not set');
+        assert(pass, 'environment variable GIT_PASSWORD not set');
+        assert(this.localRepoPath, 'environment variable LOCAL_REPO_PATH not set');
+        assert(remoteRepoPath, 'environment variable REMOTE_REPO_PATH not set');
+
+        this.remote = this.getBasicAuthUrl(remoteRepoPath, user, pass);
+        this.masterBaseDir = path.join(this.localRepoPath, 'master');
+    }
 
   initLocalRepo = () => {
-    return from(
-        this.git.cwd({path: this.masterBaseDir, root: true}).checkIsRepo(),
-    ).pipe(
-        switchMap((isRepo) => {
-          if (isRepo) {
-            this.logger.debug('current dir is already git repo');
-            return EMPTY;
-          } else {
-            this.logger.debug(
-                'dir exists, but is not a repo. deleting any files!',
-            );
-            emptyDirSync(this.masterBaseDir);
-            return this.git.clone(this.remote, this.masterBaseDir);
-          }
-        }),
-    );
+      const isRepo = from(
+          this.git.cwd({path: this.masterBaseDir}).checkIsRepo(),
+      );
+
+      const newRepo = isRepo.pipe(
+          filter((result) => !result),
+          switchMap(() => {
+              this.logger.debug('dir exists, but is not a repo. deleting any files!');
+              emptyDirSync(this.masterBaseDir);
+              return this.git.clone(this.remote, this.masterBaseDir);
+          }),
+          catchError((err => {
+              this.logger.debug('error while cloning' + err.message);
+              return EMPTY;
+          }))
+      );
+
+      const existingRepo = isRepo.pipe(
+          filter((result) => result),
+          tap(() => {
+              this.logger.debug('current dir is already git repo');
+          }),
+      );
+
+      return merge(newRepo, existingRepo).pipe(
+          catchError((error: any) => {
+              this.logger.error('could not clone repository', error.message);
+              return EMPTY;
+          }),
+      );
   };
 
-  onApplicationBootstrap(): any {
-    this.createIfNotExist(this.repoBaseDir);
-    this.createIfNotExist(this.masterBaseDir);
-    this.initLocalRepo().subscribe(() =>
-        this.logger.log('successful init of local repo'),
-    );
-  }
-
-  getBasicAuthUrl(repo: string) {
-    const user = process.env.GIT_USER;
-    const pass = process.env.GIT_PASSWORD;
-    assert(user, 'environment variable GIT_USER not set');
-    assert(pass, 'environment variable GIT_PASSWORD not set');
-    return `https://${user}:${pass}@${repo}`;
-  }
-
-  createIfNotExist(dir: string) {
-    if (!fs.existsSync(dir)) {
-      this.logger.debug('creating dir ', dir);
-      fs.mkdirSync(dir);
-    } else {
-      this.logger.debug('skipping creation dir ', dir);
+    createWatchBranchCronJob(localPath: string, branchName: string) {
+        return () => {
+            this.logger.debug('getting changes from ' + branchName + ' on local path ' + localPath);
+            from(
+                this.git
+                    .cwd(localPath)
+                    .fetch()
+                    .diffSummary([branchName, `origin/${branchName}`]),
+            )
+                .pipe(
+                    map(({changed, deletions, insertions}) => {
+                        let changesCount = changed + deletions + insertions;
+                        changesCount > 0 &&
+                        this.logger.debug(
+                            ` changed: ${changed} deletions: ${deletions} insertions: ${insertions}`,
+                        );
+                        return changesCount;
+                    }),
+                    filter((changes) => changes > 0),
+                    switchMap((changes) => {
+                        this.logger.log(`found ${changes} changes. Pulling...`);
+                        return this.git.pull();
+                    }),
+                    catchError((error) => {
+                        this.logger.error('could not diff ' + error.message);
+                        return EMPTY
+                    })
+                )
+                .subscribe((pullResult) => {
+                    this.logger.debug(pullResult.summary);
+                });
+        };
     }
-  }
+
+    startWatching(localPath: string, branchName: string) {
+        let job = new CronJob(
+            CronExpression.EVERY_30_SECONDS,
+            this.createWatchBranchCronJob(localPath, branchName),
+        );
+        this.schedulerRegistry.addCronJob('watch-branch' + '-' + branchName, job);
+        job.start();
+    }
+
+    onApplicationBootstrap(): any {
+        this.createIfNotExist(this.localRepoPath);
+        this.createIfNotExist(this.masterBaseDir);
+        this.initLocalRepo().subscribe(() => {
+            this.startWatching(this.masterBaseDir, 'main');
+            this.logger.log('successful init of local repo');
+        });
+    }
+
+    getBasicAuthUrl(repo: string, user: string, password: string) {
+        return `https://${user}:${password}@${repo}`;
+    }
+
+    createIfNotExist(dir: string) {
+        if (!fs.existsSync(dir)) {
+            this.logger.debug('creating directory ', dir);
+            fs.mkdirSync(dir);
+        } else {
+            this.logger.debug('skipping creation of directory ', dir);
+        }
+    }
 }
